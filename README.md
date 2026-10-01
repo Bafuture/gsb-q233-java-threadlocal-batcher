@@ -30,3 +30,41 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 233）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（分支 A）
+
+组件位于 `src/main/java/com/example/gsb/batcher/`：
+
+| 类 | 职责 |
+|----|------|
+| `ThreadLocalBatcher` | 核心：线程本地缓冲、批量/超时刷出、内存上限、flushAll、统计 |
+| `Batch` | 刷出单元，携带 `(ownerId, sequence)` 幂等键 |
+| `BatchSink` / `DeduplicatingSink` | 下游接口 / 按序号去重的幂等包装器 |
+| `AutoFlushingThreadFactory` | 线程退出前自动刷出的线程工厂 |
+| `BatcherConfig` / `BatcherStats` / `FlushReport` / `WriteRejectedException` | 配置、统计快照、flushAll 报告、拒绝异常 |
+
+### 行为约定
+
+1. **缓冲与触发**：每线程独立缓冲；达到 `maxBatchSize` 立即刷出，最老条目驻留超过
+   `flushInterval` 由后台守护线程刷出。
+2. **顺序保证**：同一线程的写入严格按提交顺序刷出（批内有序、批次序号单调递增）。
+   **不同线程之间的相对顺序不做任何保证**——需要全局有序时请在下游按业务键排序。
+3. **内存上限**：全局缓冲条数达到 `maxBufferedItems` 时，写入线程先刷出自己的缓冲；
+   仍放不下则抛 `WriteRejectedException`（计入 `rejectedCount`），缓冲不会无限增长。
+4. **崩溃安全**：下游失败时数据保留、序号不变，重试重发相同 `(ownerId, sequence)`；
+   下游用 `DeduplicatingSink` 按幂等键去重后，结果与只刷一次一致。
+5. **flushAll(timeout)**：刷空所有已注册线程的缓冲；超时返回 `FlushReport`，
+   `unfinishedOwners` 列出未完成线程（如下游持续失败）。
+6. **线程退出**：`batcher.threadFactory()` 创建的线程退出前自动刷出；线程池复用线程时
+   用 `batcher.wrap(Runnable)` 包裹任务，任务结束即刷出，回收线程不丢数据；
+   `close()` 停止后台线程并做最后一次 flushAll。
+7. **统计**：`stats()` 返回刷出次数、累计刷出条目、合并比例（条目数/刷出次数）、
+   拒绝次数、刷出失败次数、全局缓冲量与各线程缓冲深度。
+
+### 运行
+
+```bash
+./mvnw -q verify   # 17 个测试：顺序保持、批量/超时触发、内存上限、幂等、flushAll、线程退出、统计
+```
