@@ -30,3 +30,30 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 233）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明：`com.example.gsb.batcher`
+
+- `ThreadLocalBatcher<T>`：核心组件。每个线程首次写入时注册独立缓冲，
+  达到 `batchSize`、缓冲最老数据超过 `flushInterval`、显式 `flushAll`、
+  线程退出（后台 housekeeper 检测 `Thread.isAlive()`）或 `close()` 时刷出。
+- `FlushBatch<T>`：批次记录，带 `(ownerThreadId, sequence)` 幂等键；
+  单线程内序号从 0 严格递增。
+- `IdempotentSink<T>`：按幂等键去重的下游包装；重复刷出（崩溃重试）
+  与只刷一次结果一致。sink 失败时批次原样放回缓冲且序号不前进（at-least-once）。
+- 内存上限：所有线程缓冲条数受 `maxGlobalBuffered` 约束，超限按
+  `OverflowPolicy.FLUSH`（先刷当前线程缓冲）或 `REJECT`
+  （抛 `WriteRejectedException`）处理，不会无限增长。
+- `flushAll(Duration)`：逐缓冲加锁刷出，超时后 `FlushAllResult` 报告
+  已完成与未完成线程列表。
+- 顺序语义：**同一线程**的写入严格按提交顺序刷出（批次内有序、批次间序号递增）；
+  **不同线程**的批次可并发刷出，全局相对顺序不做保证，下游只能依赖单线程顺序。
+- 线程池：池线程复用时缓冲复用（超时刷出兜底）；池线程死亡时 housekeeper
+  自动刷出其缓冲，不丢数据。
+- 统计 `BatcherStats`：刷出次数、写入/刷出条数、合并比例（条数/次数）、
+  拒绝次数、各线程缓冲深度。
+
+测试见 `src/test/java/com/example/gsb/batcher/ThreadLocalBatcherTest.java`，
+覆盖顺序保持（单线程 + 多线程）、批量与超时触发、内存上限（拒绝/刷出两种策略）、
+重复刷出幂等（含失败重试保序）、flushAll 超时报告、线程退出与线程池回收、统计。
